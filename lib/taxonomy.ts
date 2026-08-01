@@ -53,12 +53,28 @@ export interface UserProfile {
 
 export type SwipeDirection = "accept" | "skip" | "later";
 
+// Content tiers for the drift-aware router. `stretch` is the growth content,
+// `easy` is low-friction on-goal content, `bridge` is everything else on-goal,
+// and `off_goal` is outside the user's stated interests. The router only ever
+// lowers friction *within* the goal (toward `easy`); it never autonomously
+// serves `off_goal` content. See lib/engine.ts driftState/classifyTier.
+export type Tier = "stretch" | "bridge" | "easy" | "off_goal";
+
+export type DriftState = "healthy" | "mild_drift" | "heavy_drift";
+
 export interface Interaction {
   recommendationId: string;
   category: Category;
   format: Format;
   direction: SwipeDirection;
   timestamp: number;
+  // Milliseconds the card was on top before the user swiped. A fast skip on a
+  // long card is a *format* rejection, not a topic rejection (validated against
+  // the dwell-time denoising used by Inshorts/BookMyShow-class recommenders).
+  timeToSwipeMs?: number;
+  // Tier of the card at interaction time, denormalized so driftState is a pure
+  // function of history without needing to re-look-up the corpus.
+  tier?: Tier;
 }
 
 export interface Weights {

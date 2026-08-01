@@ -7,6 +7,7 @@ import {
   type SwipeDirection,
   type Insight,
   type Recommendation,
+  type DriftState,
   RECOMMENDATIONS,
   createEngine,
   applySwipe,
@@ -14,6 +15,8 @@ import {
   applyVoiceIntent,
   detectInsight,
   reSurface,
+  driftState,
+  dismissInsightAsBusy,
 } from "@/lib/engine";
 import { compressCognitiveState } from "@/lib/cognitive";
 import { type VoiceReading } from "@/lib/voice";
@@ -33,6 +36,16 @@ export function useEngine() {
   const [messages, setMessages] = useState<CoachMessage[]>([]);
   const [reading, setReading] = useState<VoiceReading | null>(null);
   const lastInsightAt = useRef(0);
+  // When the current top card was first shown — lets us measure dwell time
+  // (timeToSwipeMs) without any change to the card UI. A fast skip on a long
+  // card is treated as a format rejection, not a topic rejection (Fix 1).
+  const cardShownAt = useRef(0);
+
+  // Drift state drives the fatigue-aware router and the (optional) cooldown UI.
+  const drift: DriftState = useMemo(
+    () => (state ? driftState(state.history) : "healthy"),
+    [state]
+  );
 
   // Compressed Cognitive State — rebuilt from scratch each turn (never
   // appended), so it stays O(1) in session length. Drives the wellbeing radar
@@ -45,15 +58,22 @@ export function useEngine() {
   const start = useCallback((p: UserProfile) => {
     setProfile(p);
     setState(createEngine(p));
+    cardShownAt.current = Date.now();
   }, []);
 
   const swipe = useCallback(
     (card: Recommendation, direction: SwipeDirection) => {
       if (!state || !profile) return;
-      const next = applySwipe(state, card, direction, profile);
+      const now = Date.now();
+      // Dwell on the top card since it was shown. Guarded so the very first
+      // swipe (or a rehydrated session) doesn't report a bogus multi-hour dwell.
+      const shownAt = cardShownAt.current;
+      const timeToSwipeMs = shownAt > 0 ? now - shownAt : undefined;
+      cardShownAt.current = now;
+
+      const next = applySwipe(state, card, direction, profile, timeToSwipeMs);
       setState(next);
 
-      const now = Date.now();
       if (now - lastInsightAt.current > INSIGHT_COOLDOWN_MS) {
         const insight = detectInsight(next, profile);
         if (insight) {
@@ -77,7 +97,20 @@ export function useEngine() {
     if (!state || !profile || !activeInsight) return;
     setState(applyInsight(state, activeInsight, profile));
     setActiveInsight(null);
+    cardShownAt.current = Date.now(); // back to the deck; restart the dwell clock
     setToast("Recommendations updated");
+    setTimeout(() => setToast(null), 2200);
+  }, [state, profile, activeInsight]);
+
+  // "That's not it — I'm just busy": keep the interest the engine thought was
+  // fading, and don't nag about it again. Pairs with Fix 1 (fast skips already
+  // avoid eroding the topic weight in the first place).
+  const dismissAsBusy = useCallback(() => {
+    if (!state || !profile || !activeInsight) return;
+    setState(dismissInsightAsBusy(state, activeInsight, profile));
+    setActiveInsight(null);
+    cardShownAt.current = Date.now();
+    setToast("Kept — we'll ease off, not drop it");
     setTimeout(() => setToast(null), 2200);
   }, [state, profile, activeInsight]);
 
@@ -104,12 +137,14 @@ export function useEngine() {
       dismissedInsights: new Set(Array.from(state.dismissedInsights).concat(activeInsight.id)),
     });
     setActiveInsight(null);
+    cardShownAt.current = Date.now();
   }, [state, activeInsight]);
 
   return {
     profile,
     state,
     ccs,
+    drift,
     activeInsight,
     toast,
     messages,
@@ -120,5 +155,6 @@ export function useEngine() {
     converse,
     applyActiveInsight,
     dismissInsight,
+    dismissAsBusy,
   };
 }

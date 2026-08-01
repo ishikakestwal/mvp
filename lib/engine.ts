@@ -24,6 +24,8 @@ import {
   type Interaction,
   type Weights,
   type Counters,
+  type Tier,
+  type DriftState,
 } from "./taxonomy";
 
 import {
@@ -157,6 +159,73 @@ function initialWeights(profile: UserProfile): Weights {
   return { categories, formats };
 }
 
+// ---------------------------------------------------------------------------
+// Drift-aware router — the mechanism that makes "we optimise for who you're
+// becoming, not for attention" true instead of aspirational. When the user is
+// fatiguing (skip streak / low completion) the router lowers friction *within
+// the goal* (tilts ranking toward `easy`, same topics) — it NEVER autonomously
+// serves off-goal content to keep the user swiping. We narrow the friction,
+// not the topic. (Off-goal content is only ever reachable via an explicit,
+// consent-gated cooldown card in the UI — not from this ranking path.)
+// ---------------------------------------------------------------------------
+
+/** Classify a card into a friction tier relative to the user's stated goal. */
+export function classifyTier(card: Recommendation, profile: UserProfile): Tier {
+  const onGoal = profile.interests.includes(card.category);
+  if (!onGoal) return "off_goal";
+  const heavyFormat = card.format === "project" || card.format === "read";
+  const lightFormat = card.format === "video" || card.format === "bite";
+  if (card.duration >= 15 && heavyFormat) return "stretch";
+  if (card.duration <= 15 && lightFormat) return "easy";
+  return "bridge";
+}
+
+/**
+ * Drift state over the most recent `window` interactions — a pure function of
+ * history, ported from the reference SQL. Uses the denormalized `tier` on each
+ * interaction (falls back to `bridge` for older records without one).
+ *
+ * Skip-streak is counted from the most recent on-goal interaction backward;
+ * completion uses `accept` as a proxy for finishing the content.
+ */
+export function driftState(history: Interaction[], window = 10): DriftState {
+  const recent = history.slice(-window);
+  if (recent.length < 3) return "healthy"; // not enough data — benefit of the doubt
+
+  const tierOf = (i: Interaction): Tier => i.tier ?? "bridge";
+  const offGoal = recent.filter((i) => tierOf(i) === "off_goal");
+  const onGoal = recent.filter((i) => tierOf(i) !== "off_goal");
+  const offGoalRatio = recent.length ? offGoal.length / recent.length : 0;
+
+  // Current skip streak among on-goal interactions, most-recent-first.
+  let skipStreak = 0;
+  for (let k = onGoal.length - 1; k >= 0; k--) {
+    if (onGoal[k].direction === "skip") skipStreak++;
+    else break;
+  }
+
+  const completion =
+    onGoal.length > 0
+      ? onGoal.filter((i) => i.direction === "accept").length / onGoal.length
+      : null;
+
+  if (skipStreak >= 2 || offGoalRatio >= 0.4) return "heavy_drift";
+  if (completion !== null && completion < 0.6) return "mild_drift";
+  return "healthy";
+}
+
+/** Which tier the router prefers to surface next, given the drift state. */
+export function preferredTier(drift: DriftState): Tier {
+  if (drift === "healthy") return "stretch";
+  if (drift === "mild_drift") return "bridge";
+  return "easy"; // heavy_drift — lower friction, still on-goal (never off_goal)
+}
+
+// A soft ranking tilt, not a hard filter: cards in the preferred tier rise, but
+// nothing is removed from the deck, so the DPP still guarantees diversity and
+// the engine never collapses onto a single card.
+const TIER_MATCH_BOOST = 12;
+
 // Scoring + queue ordering.
 
 export function scoreCard(
@@ -164,7 +233,8 @@ export function scoreCard(
   weights: Weights,
   seen: Set<string>,
   ccs?: CompressedCognitiveState | null,
-  profile?: UserProfile
+  profile?: UserProfile,
+  preferTier?: Tier | null
 ): number {
   const cat = weights.categories[card.category] ?? 0;
   const fmt = weights.formats[card.format] ?? 0;
@@ -173,7 +243,12 @@ export function scoreCard(
   // The eudaimonic layer tilts ranking toward the neglected wellbeing axis and
   // the active corrective pivot. Small by design — revealed taste still leads.
   const eudaimonic = ccs && profile ? eudaimonicBonus(card, ccs, profile) : 0;
-  return base + eudaimonic;
+  // Drift tilt: under fatigue the router nudges lighter on-goal content up.
+  const drift =
+    preferTier && profile && classifyTier(card, profile) === preferTier
+      ? TIER_MATCH_BOOST
+      : 0;
+  return base + eudaimonic + drift;
 }
 
 function sortedQueue(
@@ -184,9 +259,11 @@ function sortedQueue(
   history: Interaction[]
 ): Recommendation[] {
   const ccs = compressCognitiveState(history, profile, RECOMMENDATIONS);
+  // The router reads the recent history and picks the friction tier to favour.
+  const prefer = preferredTier(driftState(history));
   const scored = cards.map((c) => ({
     card: c,
-    score: scoreCard(c, weights, seen, ccs, profile),
+    score: scoreCard(c, weights, seen, ccs, profile, prefer),
   }));
   // Relevance-first order — both the sensible fallback and the quality signal
   // the DPP consumes.
@@ -262,14 +339,36 @@ export function applySwipe(
   state: EngineState,
   card: Recommendation,
   direction: SwipeDirection,
-  profile: UserProfile
+  profile: UserProfile,
+  timeToSwipeMs?: number
 ): EngineState {
   const mag = SWEEP_MAGNITUDE[direction];
   const LEARN = 9;
 
+  // Fix 1 — swipe-signal compression. A fast skip on a long/stretch card is a
+  // "wrong format for right now" signal, not "wrong topic": penalise the format
+  // fully but the category only fractionally. (Same dwell-time denoising that
+  // Inshorts/BookMyShow-class recommenders use to filter accidental swipes.)
+  const tier = classifyTier(card, profile);
+  const fastSkip =
+    direction === "skip" &&
+    timeToSwipeMs != null &&
+    timeToSwipeMs < 5000 &&
+    (tier === "stretch" || card.duration >= 15);
+  const categoryFraction = fastSkip ? 0.3 : 1;
+
+  // Fix 2 — cold-start dampening. Early exploratory swipes shouldn't violently
+  // reshape the topic profile before there's evidence: scale the category delta
+  // by how much we've already seen of this category (full strength by the 5th).
+  const priorCat = state.counters.categories[card.category];
+  const catSeen = priorCat.accept + priorCat.skip + priorCat.later;
+  const coldStartDamp = Math.min(1, catSeen / 5);
+
   const categories = { ...state.weights.categories };
   const formats = { ...state.weights.formats };
-  categories[card.category] = clamp01(categories[card.category] + mag * LEARN);
+  categories[card.category] = clamp01(
+    categories[card.category] + mag * LEARN * categoryFraction * coldStartDamp
+  );
   formats[card.format] = clamp01(formats[card.format] + mag * LEARN);
 
   // Normalize so the top weight maps to 100 and others scale relatively.
@@ -294,6 +393,8 @@ export function applySwipe(
     format: card.format,
     direction,
     timestamp: Date.now(),
+    timeToSwipeMs,
+    tier,
   };
 
   const seen = new Set(state.seen);
@@ -355,6 +456,28 @@ export function applyInsight(
     queue,
     appliedInsights: new Set(Array.from(state.appliedInsights).concat(insight.id)),
   };
+}
+
+// Fix 3 — "That's not it, I'm just busy." The plain-language correction for a
+// contradiction insight: the user is telling us they skipped an interest for
+// time, not taste. Restore the eroded category weight (opposite sign to the
+// insight's proposed penalty) and dismiss the insight so it won't re-fire.
+export function dismissInsightAsBusy(
+  state: EngineState,
+  insight: Insight,
+  profile: UserProfile
+): EngineState {
+  const dismissed = new Set(Array.from(state.dismissedInsights).concat(insight.id));
+  if (!insight.target || insight.target.type !== "category" || insight.delta == null) {
+    return { ...state, dismissedInsights: dismissed };
+  }
+  const categories = { ...state.weights.categories };
+  const cat = insight.target.value as Category;
+  // insight.delta is the negative penalty the engine would apply; reverse it.
+  categories[cat] = clamp01(categories[cat] + Math.abs(insight.delta));
+  const norm = normalize({ categories, formats: { ...state.weights.formats } });
+  const queue = sortedQueue(state.queue, norm, profile, state.seen, state.history);
+  return { ...state, weights: norm, queue, dismissedInsights: dismissed };
 }
 
 // ---------------------------------------------------------------------------
